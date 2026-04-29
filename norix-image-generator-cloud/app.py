@@ -125,6 +125,46 @@ def get_api_key(provider: str, openai_key: str, gemini_key: str, claude_key: str
     return False, "알 수 없는 공급자입니다."
 
 
+def strip_numbers_from_prompt(text: str) -> str:
+    """
+    프롬프트에서 숫자, 통계, 금액, 퍼센트 등을 자동으로 제거합니다.
+    Claude 보정을 쓰지 않을 때를 위한 보조 안전장치입니다.
+    """
+    import re
+
+    # 한글 숫자 표현 (예: "3천 명", "800만 원", "30대", "10년")
+    text = re.sub(r"\d+\s*[천백만억조]+\s*[원명개세대년월일분초%퍼센트]?", "", text)
+    # "30대", "40대" 같은 표현
+    text = re.sub(r"\d+\s*대(?=\s|$|[^a-zA-Z가-힣])", "", text)
+    # 일반 숫자 (1, 1,000, 1.5 등)
+    text = re.sub(r"\d{1,3}(,\d{3})+", "", text)
+    text = re.sub(r"\d+(\.\d+)?", "", text)
+    # 통화 기호와 단위
+    text = re.sub(r"[$€¥₩]", "", text)
+    # 연속된 공백 정리
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
+
+
+def koreanize_prompt(text: str) -> str:
+    """
+    Claude 보정을 쓰지 않을 때, 원본 프롬프트에 한국화와 실사화 키워드를 자동으로 추가합니다.
+    """
+    # 먼저 숫자 제거
+    cleaned = strip_numbers_from_prompt(text)
+
+    # 한국 + 실사 키워드를 영어로 강하게 추가
+    suffix = (
+        ", Korean people only, Korean appearance with black hair and East Asian features, "
+        "set in Korea, photorealistic cinematic photograph, shot on Sony A7 IV with 85mm lens, "
+        "natural lighting, real photograph style, NOT anime, NOT illustration, NOT 3D render, "
+        "NO numbers or text in image"
+    )
+
+    return cleaned + suffix
+
+
 def generate_image_by_provider(
     provider: str,
     prompt: str,
@@ -215,6 +255,7 @@ with st.sidebar:
         "이미지 비율",
         [
             "16:9 유튜브용",
+            "16:9 PPT용",
             "9:16 쇼츠/릴스용",
             "1:1 카드뉴스용",
         ],
@@ -286,10 +327,43 @@ short_prompts = [p for p in prompts if len(p) < 10]
 if short_prompts:
     st.info(f"너무 짧은 프롬프트가 {len(short_prompts)}개 있습니다. Claude 보정을 쓰면 품질이 좋아질 수 있습니다.")
 
-start_button = st.button("이미지 생성 시작", type="primary", disabled=not prompts)
+# 세션 상태 초기화
+if "stop_requested" not in st.session_state:
+    st.session_state["stop_requested"] = False
+if "is_generating" not in st.session_state:
+    st.session_state["is_generating"] = False
+if "regenerate_index" not in st.session_state:
+    st.session_state["regenerate_index"] = None
+if "last_project_name" not in st.session_state:
+    st.session_state["last_project_name"] = ""
+if "last_prompts" not in st.session_state:
+    st.session_state["last_prompts"] = []
+
+
+def request_stop():
+    st.session_state["stop_requested"] = True
+
+
+# 시작 버튼과 멈추기 버튼 나란히 배치
+btn_col1, btn_col2 = st.columns([1, 1])
+with btn_col1:
+    start_button = st.button(
+        "이미지 생성 시작",
+        type="primary",
+        disabled=not prompts or st.session_state.get("is_generating", False),
+        use_container_width=True,
+    )
+with btn_col2:
+    stop_button = st.button(
+        "⏹ 멈추기",
+        disabled=not st.session_state.get("is_generating", False),
+        on_click=request_stop,
+        use_container_width=True,
+    )
 
 progress_bar = st.progress(0)
 log_box = st.empty()
+live_gallery_area = st.container()
 result_download_area = st.container()
 gallery_area = st.container()
 
@@ -300,7 +374,15 @@ if start_button:
         st.error(key_message)
         st.stop()
 
+    # 생성 시작: 상태 초기화
+    st.session_state["stop_requested"] = False
+    st.session_state["is_generating"] = True
+
     project_name = sanitize_project_name(project_name_input)
+
+    # 다시 만들기 기능을 위해 마지막 프로젝트/프롬프트 기억
+    st.session_state["last_project_name"] = project_name
+    st.session_state["last_prompts"] = prompts
 
     output_root = Path("outputs")
     output_dir = output_root / project_name
@@ -312,12 +394,39 @@ if start_button:
     logs = []
     total = len(prompts)
 
+    # 실시간 갤러리 초기화: 4열 그리드를 미리 만들어두고 자리(placeholder)를 잡아둡니다
+    with live_gallery_area:
+        st.subheader("실시간 결과 (생성되는 대로 표시)")
+        gallery_cols = st.columns(4)
+        image_placeholders = []
+        for i in range(total):
+            col = gallery_cols[i % 4]
+            with col:
+                ph = st.empty()
+                image_placeholders.append(ph)
+
     for i, original_prompt in enumerate(prompts, start=1):
+        # 멈추기 버튼이 눌렸는지 확인
+        if st.session_state.get("stop_requested", False):
+            logs.append(f"⏹ 사용자가 멈추기를 눌러서 {i}/{total}에서 정지했습니다.")
+            log_box.text("\n".join(logs[-15:]))
+            break
+
         filename = f"{i:03d}.png"
         output_path = output_dir / filename
 
         if resume_mode and output_path.exists():
             logs.append(f"{i}/{total} 이미 존재해서 건너뜀: {filename}")
+
+            # 이미 만들어진 이미지도 갤러리에 즉시 표시
+            try:
+                image_placeholders[i - 1].image(
+                    str(output_path),
+                    caption=f"{filename} (기존)",
+                    use_container_width=True,
+                )
+            except Exception:
+                pass
 
             row = {
                 "index": i,
@@ -361,6 +470,9 @@ if start_button:
                         api_key=claude_key,
                         ratio_label=ratio_label,
                     )
+                else:
+                    # Claude 보정을 안 쓸 때도 자동으로 한국화 + 실사화 + 숫자 제거 적용
+                    enhanced_prompt = koreanize_prompt(original_prompt)
 
                 logs.append(f"{i}/{total} 이미지 생성 중...")
                 log_box.text("\n".join(logs[-15:]))
@@ -378,6 +490,17 @@ if start_button:
 
                 logs.append(f"{i}/{total} 생성 완료: {filename}")
                 success = True
+
+                # 갤러리에 새 이미지 즉시 표시
+                try:
+                    image_placeholders[i - 1].image(
+                        str(output_path),
+                        caption=filename,
+                        use_container_width=True,
+                    )
+                except Exception:
+                    pass
+
                 break
 
             except Exception as e:
@@ -411,7 +534,15 @@ if start_button:
         if delay_seconds > 0:
             time.sleep(delay_seconds)
 
-    st.success("이미지 생성 작업이 완료되었습니다.")
+    # 생성 끝: 상태 정리
+    was_stopped = st.session_state.get("stop_requested", False)
+    st.session_state["is_generating"] = False
+    st.session_state["stop_requested"] = False
+
+    if was_stopped:
+        st.warning("⏹ 사용자가 멈춰서 작업이 중단됐습니다. 지금까지 만든 이미지는 그대로 저장돼 있어요. '이어하기 모드'를 켜고 다시 시작하면 멈춘 지점부터 이어서 만듭니다.")
+    else:
+        st.success("이미지 생성 작업이 완료되었습니다.")
 
     zip_path = create_zip(output_dir)
 
@@ -435,7 +566,7 @@ if start_button:
             )
 
     with gallery_area:
-        st.subheader("결과 미리보기")
+        st.subheader("결과 미리보기 (마음에 안 드는 이미지는 다시 만들기)")
 
         image_files = sorted(output_dir.glob("*.png"))
 
@@ -445,8 +576,72 @@ if start_button:
             for idx, img_path in enumerate(image_files):
                 with cols[idx % 4]:
                     st.image(str(img_path), caption=img_path.name, use_container_width=True)
+                    # 다시 만들기 버튼
+                    img_index = int(img_path.stem)  # "001.png" → 1
+                    if st.button("🔄 이 이미지 다시 만들기", key=f"regen_{img_index}"):
+                        # 기존 파일 삭제하고 인덱스 저장
+                        try:
+                            img_path.unlink()
+                        except Exception:
+                            pass
+                        st.session_state["regenerate_index"] = img_index
+                        st.rerun()
         else:
             st.info("생성된 이미지가 없습니다.")
 
 else:
-    st.info("프롬프트를 입력하고 설정을 확인한 뒤 이미지 생성 시작 버튼을 누르세요.")
+    # 다시 만들기 요청이 있는지 확인
+    regen_idx = st.session_state.get("regenerate_index")
+    if regen_idx is not None and st.session_state.get("last_prompts"):
+        st.info(f"🔄 {regen_idx}번 이미지를 다시 만드는 중입니다...")
+
+        # 다시 만들기 실행
+        last_prompts = st.session_state["last_prompts"]
+        last_project = st.session_state["last_project_name"]
+
+        if 1 <= regen_idx <= len(last_prompts):
+            key_ok, key_message = get_api_key(provider, openai_key, gemini_key, claude_key)
+
+            if not key_ok:
+                st.error(f"{key_message} (다시 만들기 실패)")
+                st.session_state["regenerate_index"] = None
+            else:
+                output_dir = Path("outputs") / last_project
+                output_dir.mkdir(parents=True, exist_ok=True)
+
+                original_prompt = last_prompts[regen_idx - 1]
+                filename = f"{regen_idx:03d}.png"
+                output_path = output_dir / filename
+
+                try:
+                    if provider.startswith("Claude 보정"):
+                        st.write(f"Claude 프롬프트 보정 중...")
+                        enhanced_prompt = enhance_prompt_with_claude(
+                            original_prompt=original_prompt,
+                            style=enhance_style,
+                            model=claude_model,
+                            api_key=claude_key,
+                            ratio_label=ratio_label,
+                        )
+                    else:
+                        enhanced_prompt = koreanize_prompt(original_prompt)
+
+                    st.write(f"이미지 생성 중...")
+                    generate_image_by_provider(
+                        provider=provider,
+                        prompt=enhanced_prompt,
+                        output_path=output_path,
+                        ratio_label=ratio_label,
+                        openai_model=openai_model,
+                        gemini_model=gemini_model,
+                        openai_key=openai_key,
+                        gemini_key=gemini_key,
+                    )
+                    st.success(f"✅ {filename} 다시 만들기 완료!")
+                    st.image(str(output_path), caption=filename, use_container_width=True)
+                except Exception as e:
+                    st.error(f"다시 만들기 실패: {e}")
+                finally:
+                    st.session_state["regenerate_index"] = None
+    else:
+        st.info("프롬프트를 입력하고 설정을 확인한 뒤 이미지 생성 시작 버튼을 누르세요.")
